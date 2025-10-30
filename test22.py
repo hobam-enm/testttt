@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 # 💬 유튜브 댓글분석기 — 순수 챗봇 모드 (세션 관리 기능 최종 + URL 수집 케이스 1~3 반영)
+# [패치 요약]
+# - 엔티티 제거: 메인 키워드 1개만 추출/검색
+# - 최소 오류 방지: shutil.copyfile로 복사(윈도우 호환), ISO 파싱 실패 시 최근 7일 자동 적용
+# - 시각화 이식: 다운로드 블록 바로 아래에 정량 시각화(키워드 버블, 시계열, Top10 등) 노출
 
 import streamlit as st
 import pandas as pd
@@ -14,12 +18,25 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 import io
+import shutil  # ✅ 최소 패치: Windows 호환 파일 복사
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import google.generativeai as genai
 from streamlit.components.v1 import html as st_html
 
+# === 시각화 의존성 (없어도 앱이 깨지지 않게 가드) ===
+try:
+    import plotly.express as px
+    from plotly import graph_objects as go
+    import circlify
+    import stopwordsiso as stopwords
+    from kiwipiepy import Kiwi
+    import numpy as np
+    _VIS_READY = True
+except Exception:
+    _VIS_READY = False
+    Kiwi = None
 
 # ==============================================================================
 # 페이지/전역 설정
@@ -91,19 +108,18 @@ st.markdown(
   /* 새 채팅 버튼 스타일 */
   .new-chat-btn button {
       background-color: #e8f0fe;
-      color: #0052CC !important; /* 선명한 파란색 텍스트 */
+      color: #0052CC !important;
       border: 1px solid #d2e3fc !important;
   }
   .new-chat-btn button:hover {
       background-color: #d2e3fc;
-      color: #0041A3 !important; /* 오타 수정: 'olor' -> 'color' */
+      color: #0041A3 !important;
       border: 1px solid #c2d8f8 !important;
   }
 </style>
 """,
     unsafe_allow_html=True
 )
-
 
 # --- 경로 및 GitHub 설정 ---
 BASE_DIR = "/tmp"
@@ -116,22 +132,18 @@ GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
 
 KST = timezone(timedelta(hours=9))
 
-
 def now_kst() -> datetime:
     return datetime.now(tz=KST)
-
 
 def to_iso_kst(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=KST)
     return dt.astimezone(KST).isoformat(timespec="seconds")
 
-
 def kst_to_rfc3339_utc(dt_kst: datetime) -> str:
     if dt_kst.tzinfo is None:
         dt_kst = dt_kst.replace(tzinfo=KST)
     return dt_kst.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
 
 # ==============================================================================
 # 키/상수
@@ -144,7 +156,6 @@ GEMINI_TIMEOUT    = 120
 GEMINI_MAX_TOKENS = 2048
 MAX_TOTAL_COMMENTS   = 120_000
 MAX_COMMENTS_PER_VID = 4_000
-
 
 # ==============================================================================
 # 세션 상태 관리
@@ -162,9 +173,7 @@ def ensure_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
-
 ensure_state()
-
 
 # ==============================================================================
 # GitHub API 함수
@@ -174,7 +183,6 @@ def _gh_headers(token: str):
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json"
     }
-
 
 def github_upload_file(repo, branch, path_in_repo, local_path, token):
     url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}"
@@ -197,14 +205,12 @@ def github_upload_file(repo, branch, path_in_repo, local_path, token):
     resp.raise_for_status()
     return resp.json()
 
-
 def github_list_dir(repo, branch, folder, token):
     url = f"https://api.github.com/repos/{repo}/contents/{folder}?ref={branch}"
     resp = requests.get(url, headers=_gh_headers(token))
     if resp.ok:
         return [item['name'] for item in resp.json() if item['type'] == 'dir']
     return []
-
 
 def github_download_file(repo, branch, path_in_repo, token, local_path):
     url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}?ref={branch}"
@@ -216,7 +222,6 @@ def github_download_file(repo, branch, path_in_repo, token, local_path):
         return True
     return False
 
-
 def github_delete_folder(repo, branch, folder_path, token):
     contents_url = f"https://api.github.com/repos/{repo}/contents/{folder_path}?ref={branch}"
     headers = _gh_headers(token)
@@ -227,7 +232,6 @@ def github_delete_folder(repo, branch, folder_path, token):
         delete_url = f"https://api.github.com/repos/{repo}/contents/{item['path']}"
         data = {"message": f"delete: {item['name']}", "sha": item['sha'], "branch": branch}
         requests.delete(delete_url, headers=headers, json=data).raise_for_status()
-
 
 def github_rename_session(old_name, new_name, token):
     contents_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/sessions/{old_name}?ref={GITHUB_BRANCH}"
@@ -244,7 +248,6 @@ def github_rename_session(old_name, new_name, token):
 
     github_delete_folder(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{old_name}", token)
 
-
 # ==============================================================================
 # 세션 관리 함수
 # ==============================================================================
@@ -256,7 +259,6 @@ def _build_session_name() -> str:
     kw = (schema.get("keywords", ["NoKeyword"]))[0]
     kw_slug = re.sub(r'[^\w-]', '', kw.replace(' ', '_'))[:20]
     return f"{kw_slug}_{now_kst().strftime('%Y-%m-%d_%H%M')}"
-
 
 def save_current_session_to_github():
     if not all([GITHUB_REPO, GITHUB_TOKEN, st.session_state.chat, st.session_state.last_csv]):
@@ -279,7 +281,8 @@ def save_current_session_to_github():
         comments_path = os.path.join(local_dir, "comments.csv")
         videos_path = os.path.join(local_dir, "videos.csv")
 
-        os.system(f'cp "{st.session_state.last_csv}" "{comments_path}"')
+        # ✅ 최소 패치: Windows 호환 복사
+        shutil.copyfile(st.session_state.last_csv, comments_path)
         if st.session_state.last_df is not None:
             st.session_state.last_df.to_csv(videos_path, index=False, encoding="utf-8-sig")
 
@@ -293,7 +296,6 @@ def save_current_session_to_github():
 
     except Exception as e:
         return False, f"저장 실패: {e}"
-
 
 def load_session_from_github(sess_name: str):
     with st.spinner(f"세션 '{sess_name}' 불러오는 중..."):
@@ -342,7 +344,6 @@ def load_session_from_github(sess_name: str):
         except Exception as e:
             st.error(f"세션 로드 실패: {e}")
 
-
 # 세션 로드/삭제/이름변경 트리거 처리
 if 'session_to_load' in st.session_state:
     load_session_from_github(st.session_state.pop('session_to_load'))
@@ -367,7 +368,6 @@ if 'session_to_rename' in st.session_state:
                 st.error(f"변경 실패: {e}")
         time.sleep(1)
         st.rerun()
-
 
 # ==============================================================================
 # 사이드바 UI
@@ -463,7 +463,6 @@ with st.sidebar:
     st.markdown("""<hr><h3>📞 문의</h3><p>미디어)디지털마케팅 데이터파트</p>""", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-
 # ==============================================================================
 # 로직 (핵심 함수 정의)
 # ==============================================================================
@@ -478,7 +477,209 @@ def scroll_to_bottom():
         height=0
     )
 
+# ---------- 시각화 유틸/함수(이식) ----------
+def clean_illegal(val):
+    try:
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        if isinstance(val, str):
+            return ILLEGAL_CHARACTERS_RE.sub('', val)
+    except Exception:
+        pass
+    return val
 
+def clean_df_strings(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return df
+    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    if not obj_cols: return df
+    df2 = df.copy()
+    for c in obj_cols:
+        df2[c] = df2[c].map(clean_illegal)
+    return df2
+
+@st.cache_data(ttl=600, show_spinner=False)
+def compute_keyword_counter_from_file(csv_path: str, stopset_list: list[str], per_comment_cap: int = 200) -> list[tuple[str,int]]:
+    if not _VIS_READY or not csv_path or not os.path.exists(csv_path):
+        return []
+    from collections import Counter
+    counter = Counter()
+    try:
+        kiwi = Kiwi()
+    except Exception:
+        return []
+    stopset = set(stopset_list)
+    for chunk in pd.read_csv(csv_path, usecols=["text"], chunksize=100_000):
+        texts = (chunk["text"].astype(str).str.slice(0, per_comment_cap)).tolist()
+        if not texts:
+            continue
+        tokens = kiwi.tokenize(" ".join(texts), normalize_coda=True)
+        words = [t.form for t in tokens if t.tag in ("NNG","NNP") and len(t.form) > 1 and t.form not in stopset]
+        counter.update(words)
+    return counter.most_common(300)
+
+def keyword_bubble_figure_from_counter(counter_items: list[tuple[str,int]]):
+    if not _VIS_READY or not counter_items:
+        return None
+    df_kw = pd.DataFrame(counter_items[:30], columns=["word", "count"])
+    df_kw["label"] = df_kw["word"] + "<br>" + df_kw["count"].astype(str)
+    df_kw["scaled"] = np.sqrt(df_kw["count"])
+    circles = circlify.circlify(
+        [{"id": w, "datum": s} for w, s in zip(df_kw["word"], df_kw["scaled"])],
+        show_enclosure=False,
+        target_enclosure=circlify.Circle(x=0, y=0, r=1)
+    )
+    pos = {c.ex["id"]: (c.x, c.y, c.r) for c in circles if "id" in c.ex}
+    df_kw["x"] = df_kw["word"].map(lambda w: pos[w][0])
+    df_kw["y"] = df_kw["word"].map(lambda w: pos[w][1])
+    df_kw["r"] = df_kw["word"].map(lambda w: pos[w][2])
+    s_min, s_max = df_kw["scaled"].min(), df_kw["scaled"].max()
+    df_kw["font_size"] = df_kw["scaled"].apply(lambda s: int(10 + (s - s_min) / max(s_max - s_min, 1) * 12))
+    fig_kw = go.Figure()
+    palette = px.colors.sequential.Blues
+    df_kw["color_idx"] = df_kw["scaled"].apply(lambda s: int((s - s_min) / max(s_max - s_min, 1) * (len(palette) - 1)))
+    for _, row in df_kw.iterrows():
+        color = palette[int(row["color_idx"])]
+        fig_kw.add_shape(type="circle", xref="x", yref="y",
+                         x0=row["x"] - row["r"], y0=row["y"] - row["r"],
+                         x1=row["x"] + row["r"], y1=row["y"] + row["r"],
+                         line=dict(width=0), fillcolor=color, opacity=0.88, layer="below")
+    fig_kw.add_trace(go.Scatter(
+        x=df_kw["x"], y=df_kw["y"], mode="text",
+        text=df_kw["label"], textposition="middle center",
+        textfont=dict(color="white", size=df_kw["font_size"].tolist()),
+        hovertext=df_kw["word"] + " (" + df_kw["count"].astype(str) + ")",
+        hovertemplate="%{hovertext}<extra></extra>",
+    ))
+    fig_kw.update_xaxes(visible=False, range=[-1.05, 1.05])
+    fig_kw.update_yaxes(visible=False, range=[-1.05, 1.05], scaleanchor="x", scaleratio=1)
+    fig_kw.update_layout(title="Top30 키워드 버블", plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=0, r=0, t=40, b=0))
+    return fig_kw
+
+def timeseries_from_file(csv_path: str):
+    if not _VIS_READY or not csv_path or not os.path.exists(csv_path):
+        return None, None
+    tmin = None; tmax = None
+    for chunk in pd.read_csv(csv_path, usecols=["publishedAt"], chunksize=200_000):
+        dt = pd.to_datetime(chunk["publishedAt"], errors="coerce", utc=True)
+        if dt.notna().any():
+            lo, hi = dt.min(), dt.max()
+            tmin = lo if (tmin is None or (lo < tmin)) else tmin
+            tmax = hi if (tmax is None or (hi > tmax)) else tmax
+    if tmin is None or tmax is None:
+        return None, None
+    span_hours = (tmax - tmin).total_seconds()/3600.0
+    use_hour = (span_hours <= 48)
+
+    agg = {}
+    for chunk in pd.read_csv(csv_path, usecols=["publishedAt"], chunksize=200_000):
+        dt = pd.to_datetime(chunk["publishedAt"], errors="coerce", utc=True).dt.tz_convert("Asia/Seoul")
+        dt = dt.dropna()
+        if dt.empty: continue
+        bucket = (dt.dt.floor("H") if use_hour else dt.dt.floor("D"))
+        vc = bucket.value_counts()
+        for t, c in vc.items():
+            agg[t] = agg.get(t, 0) + int(c)
+    ts = pd.Series(agg).sort_index().rename("count").reset_index().rename(columns={"index":"bucket"})
+    return ts, ("시간별" if use_hour else "일자별")
+
+def top_authors_from_file(csv_path: str, topn=10):
+    if not _VIS_READY or not csv_path or not os.path.exists(csv_path):
+        return None
+    counts = {}
+    for chunk in pd.read_csv(csv_path, usecols=["author"], chunksize=200_000):
+        vc = chunk["author"].astype(str).value_counts()
+        for k, v in vc.items():
+            counts[k] = counts.get(k, 0) + int(v)
+    if not counts: return None
+    s = pd.Series(counts).sort_values(ascending=False).head(topn)
+    return s.reset_index().rename(columns={"index": "author", 0: "count"}).rename(columns={"count": "count"})
+
+def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, scope_label="(KST 기준)"):
+    if not _VIS_READY or not comments_csv_path or not os.path.exists(comments_csv_path):
+        return
+    with st.container(border=True):
+        st.subheader("📊 정량 요약")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            with st.container(border=True):
+                st.markdown("**① 키워드 버블**")
+                try:
+                    custom_stopwords = {
+                        "아","휴","아이구","아이쿠","아이고","어","나","우리","저희","따라","의해","을","를",
+                        "에","의","가","으로","로","에게","뿐이다","의거하여","근거하여","입각하여","기준으로",
+                        "그냥","댓글","영상","오늘","이제","뭐","진짜","정말","부분","요즘","제발","완전",
+                        "그게","일단","모든","위해","대한","있지","이유","계속","실제","유튜브","이번","가장","드라마",
+                    }
+                    try:
+                        korean_stopwords = stopwords.stopwords("ko")
+                    except Exception:
+                        korean_stopwords = set()
+                    stopset = set(korean_stopwords); stopset.update(custom_stopwords)
+                    main_kw = (st.session_state.get("last_schema", {}).get("keywords") or [""])[0]
+                    if main_kw and Kiwi is not None:
+                        tokens_q = Kiwi().tokenize(main_kw, normalize_coda=True)
+                        query_words = [t.form for t in tokens_q if t.tag in ("NNG","NNP") and len(t.form) > 1]
+                        stopset.update(query_words)
+                    with st.spinner("키워드 계산 중…"):
+                        items = compute_keyword_counter_from_file(comments_csv_path, list(stopset), per_comment_cap=200)
+                    fig = keyword_bubble_figure_from_counter(items)
+                    if fig is None:
+                        st.info("표시할 키워드가 없습니다.")
+                    else:
+                        st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.info(f"키워드 분석 불가: {e}")
+
+        with col2:
+            with st.container(border=True):
+                st.markdown("**② 시점별 댓글량 변동 추이**")
+                ts, label = timeseries_from_file(comments_csv_path)
+                if ts is not None:
+                    fig_ts = px.line(ts, x="bucket", y="count", markers=True, title=f"{label} 댓글량 추이 {scope_label}")
+                    st.plotly_chart(fig_ts, use_container_width=True)
+                else:
+                    st.info("댓글 타임스탬프가 비어 있습니다.")
+
+        if df_stats is not None and not df_stats.empty:
+            col3, col4 = st.columns(2)
+            with col3:
+                with st.container(border=True):
+                    st.markdown("**③ Top10 영상 댓글수**")
+                    top_vids = df_stats.sort_values(by="commentCount", ascending=False).head(10).copy()
+                    top_vids["title_short"] = top_vids["title"].apply(lambda t: t[:20] + "…" if isinstance(t, str) and len(t) > 20 else t)
+                    fig_vids = px.bar(top_vids, x="commentCount", y="title_short",
+                                      orientation="h", text="commentCount", title="Top10 영상 댓글수")
+                    st.plotly_chart(fig_vids, use_container_width=True)
+            with col4:
+                with st.container(border=True):
+                    st.markdown("**④ 댓글 작성자 활동량 Top10**")
+                    ta = top_authors_from_file(comments_csv_path, topn=10)
+                    if ta is not None and not ta.empty:
+                        fig_auth = px.bar(ta, x="count", y="author", orientation="h", text="count", title="Top10 댓글 작성자 활동량")
+                        st.plotly_chart(fig_auth, use_container_width=True)
+                    else:
+                        st.info("작성자 데이터 없음")
+
+        with st.container(border=True):
+            st.markdown("**⑤ 댓글 좋아요 Top10**")
+            best = []
+            for chunk in pd.read_csv(comments_csv_path, usecols=["video_id","video_title","author","text","likeCount"], chunksize=200_000):
+                chunk["likeCount"] = pd.to_numeric(chunk["likeCount"], errors="coerce").fillna(0).astype(int)
+                best.append(chunk.sort_values("likeCount", ascending=False).head(10))
+            if best:
+                df_top = pd.concat(best).sort_values("likeCount", ascending=False).head(10)
+                for _, row in df_top.iterrows():
+                    url = f"https://www.youtube.com/watch?v={row['video_id']}"
+                    st.markdown(
+                        f"<div style='margin-bottom:15px;'>"
+                        f"<b>{int(row['likeCount'])} 👍</b> — {row.get('author','')}<br>"
+                        f"<span style='font-size:14px;'>▶️ <a href='{url}' target='_blank' style='color:black; text-decoration:none;'>"
+                        f"{str(row.get('video_title','(제목없음)'))[:60]}</a></span><br>"
+                        f"> {str(row.get('text',''))[:150]}{'…' if len(str(row.get('text','')))>150 else ''}"
+                        f"</div>", unsafe_allow_html=True
+                    )
+
+# ---------- 메타/다운로드 + (추가) 시각화 ----------
 def render_metadata_and_downloads():
     if not (schema := st.session_state.get("last_schema")):
         return
@@ -529,12 +730,17 @@ def render_metadata_and_downloads():
             with col3:
                 st.download_button("영상목록", video_csv_data, f"videos_{keywords_str}_{now_str}.csv", "text/csv")
 
+        # ✅ 추가: 다운로드 블록 하단에 시각화 노출
+        try:
+            if csv_path:
+                render_quant_viz_from_paths(csv_path, df_videos, scope_label="(KST 기준)")
+        except Exception:
+            pass
 
 def render_chat():
     for msg in st.session_state.chat:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-
 
 class RotatingKeys:
     def __init__(self, keys, state_key: str, on_rotate=None):
@@ -556,7 +762,6 @@ class RotatingKeys:
         st.session_state[self.state_key] = self.idx
         if callable(self.on_rotate):
             self.on_rotate(self.idx, self.current())
-
 
 class RotatingYouTube:
     def __init__(self, keys, state_key="yt_key_idx"):
@@ -582,27 +787,23 @@ class RotatingYouTube:
                 return factory(self.service).execute()
             raise
 
-
+# ---------- 프롬프트/파서 (엔티티 제거 버전) ----------
 LIGHT_PROMPT = (
     f"역할: 유튜브 댓글 반응 분석기의 자연어 해석가.\n"
-    f"목표: 한국어 입력에서 [기간(KST)]과 [키워드/엔티티/옵션]을 해석.\n"
+    f"목표: 한국어 입력에서 [기간(KST)]과 [메인 키워드(1개)]와 [옵션]을 해석.\n"
     f"규칙:\n"
     f"- 기간은 Asia/Seoul 기준, 상대기간의 종료는 지금.\n"
-    f"- '키워드'는 검색에 사용할 가장 핵심적인 주제(프로그램, 브랜드 등) 1개로 한정한다.\n"
-    f"- '엔티티/보조'는 키워드 검색 결과 내에서 분석의 초점이 될 인물, 세부 주제 등을 포함한다.\n"
-    f"- '최근'이 없어도 '24시간/48시간/7일/3주/12개월'처럼 숫자+단위 표현은 '최근 N'으로 해석한다.\n"
+    f"- '키워드'는 검색에 사용할 가장 핵심 주제(프로그램, 브랜드, 인물 등) **1개만** 반환한다.\n"
     f"- 옵션 탐지: include_replies, channel_filter(any|official|unofficial), lang(ko|en|auto).\n\n"
-    f"출력(6줄 고정):\n"
+    f"출력(5줄 고정):\n"
     f"- 한 줄 요약: <문장>\n"
     f"- 기간(KST): <YYYY-MM-DDTHH:MM:SS+09:00> ~ <YYYY-MM-DDTHH:MM:SS+09:00>\n"
     f"- 키워드: [<핵심 키워드 1개>]\n"
-    f"- 엔티티/보조: [<인물>, <세부 주제 등>]\n"
     f"- 옵션: {{ include_replies: true|false, channel_filter: \"any|official|unofficial\", lang: \"ko|en|auto\" }}\n"
     f"- 원문: {{USER_QUERY}}\n\n"
     f"현재 KST: {to_iso_kst(now_kst())}\n"
     f"입력:\n{{USER_QUERY}}"
 )
-
 
 def call_gemini_rotating(model_name, keys, system_instruction, user_payload,
                          timeout_s=120, max_tokens=2048) -> str:
@@ -637,7 +838,6 @@ def call_gemini_rotating(model_name, keys, system_instruction, user_payload,
 
     return ""
 
-
 def parse_light_block_to_schema(light_text: str) -> dict:
     raw = (light_text or "").strip()
 
@@ -647,12 +847,8 @@ def parse_light_block_to_schema(light_text: str) -> dict:
     m_kw = re.search(r"키워드\s*:\s*\[(.*?)\]", raw, flags=re.DOTALL)
     keywords = [p.strip() for p in re.split(r"\s*,\s*", m_kw.group(1)) if p.strip()] if m_kw else []
 
-    m_ent = re.search(r"엔티티/보조\s*:\s*\[(.*?)\]", raw, flags=re.DOTALL)
-    entities = [p.strip() for p in re.split(r"\s*,\s*", m_ent.group(1)) if p.strip()] if m_ent else []
-
     m_opt = re.search(r"옵션\s*:\s*\{(.*?)\}", raw, flags=re.DOTALL)
     options = {"include_replies": False, "channel_filter": "any", "lang": "auto"}
-
     if m_opt:
         blob = m_opt.group(1)
         if ir := re.search(r"include_replies\s*:\s*(true|false)", blob, re.I):
@@ -662,9 +858,10 @@ def parse_light_block_to_schema(light_text: str) -> dict:
         if lg := re.search(r"lang\s*:\s*\"(ko|en|auto)\"", blob, re.I):
             options["lang"] = lg.group(1)
 
+    # ✅ 기간 파싱 실패 → 최근 7일 자동 적용
     if not (start_iso and end_iso):
         end_dt = now_kst()
-        start_dt = now_kst() - timedelta(hours=24)
+        start_dt = end_dt - timedelta(days=7)
         start_iso, end_iso = to_iso_kst(start_dt), to_iso_kst(end_dt)
 
     if not keywords:
@@ -673,13 +870,13 @@ def parse_light_block_to_schema(light_text: str) -> dict:
     return {
         "start_iso": start_iso,
         "end_iso": end_iso,
-        "keywords": keywords,
-        "entities": entities,
+        "keywords": keywords[:1],   # 메인 키워드 1개만
+        "entities": [],             # 엔티티 제거
         "options": options,
         "raw": raw
     }
 
-
+# ---------- YouTube 수집 ----------
 def yt_search_videos(rt, keyword, max_results, order="relevance",
                      published_after=None, published_before=None):
     video_ids, token = [], None
@@ -705,7 +902,6 @@ def yt_search_videos(rt, keyword, max_results, order="relevance",
             break
         time.sleep(0.25)
     return video_ids
-
 
 def yt_video_statistics(rt, video_ids):
     rows = []
@@ -746,7 +942,6 @@ def yt_video_statistics(rt, video_ids):
         time.sleep(0.25)
     return rows
 
-
 def yt_all_replies(rt, parent_id, video_id, title="", short_type="Clip", cap=None):
     replies, token = [], None
     while not (cap is not None and len(replies) >= cap):
@@ -781,7 +976,6 @@ def yt_all_replies(rt, parent_id, video_id, title="", short_type="Clip", cap=Non
         time.sleep(0.2)
 
     return replies[:cap] if cap is not None else replies
-
 
 def yt_all_comments_sync(rt, video_id, title="", short_type="Clip",
                          include_replies=True, max_per_video=None):
@@ -827,7 +1021,6 @@ def yt_all_comments_sync(rt, video_id, title="", short_type="Clip",
 
     return rows[:max_per_video] if max_per_video is not None else rows
 
-
 def parallel_collect_comments_streaming(video_list, rt_keys, include_replies,
                                         max_total_comments, max_per_video, prog_bar):
     out_csv = os.path.join(BASE_DIR, f"collect_{uuid4().hex}.csv")
@@ -850,6 +1043,7 @@ def parallel_collect_comments_streaming(video_list, rt_keys, include_replies,
             try:
                 if comm := f.result():
                     dfc = pd.DataFrame(comm)
+                    dfc = clean_df_strings(dfc)  # 🔧 문자열 클린(불법문자 제거)
                     dfc.to_csv(
                         out_csv,
                         index=False,
@@ -871,7 +1065,6 @@ def parallel_collect_comments_streaming(video_list, rt_keys, include_replies,
                 break
 
     return out_csv, total_written
-
 
 def serialize_comments_for_llm_from_file(csv_path: str,
                                          max_chars_per_comment=280,
@@ -910,10 +1103,8 @@ def serialize_comments_for_llm_from_file(csv_path: str,
 
     return "\n".join(lines), len(lines), total_chars
 
-
 TITLE_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s+.*$")
 HEADER_DUP_RE = re.compile(r"유튜브\s*댓글\s*분석.*", re.IGNORECASE)
-
 
 def tidy_answer(md: str) -> str:
     if not md:
@@ -931,12 +1122,8 @@ def tidy_answer(md: str) -> str:
         prev_blank = is_blank
     return "\n".join(cleaned).strip()
 
-
-# ==============================================================================
 # NEW: URL에서 videoId 추출 + 입력문에서 URL 제거
-# ==============================================================================
 YTB_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
-
 
 def extract_video_ids_from_text(text: str) -> list:
     """사용자 입력에서 YouTube 동영상 URL을 찾아 videoId 리스트로 반환."""
@@ -966,7 +1153,6 @@ def extract_video_ids_from_text(text: str) -> list:
     # 그 외 VIDEOID 단독 추정은 안전을 위해 미적용
     return list(ids)
 
-
 def strip_urls(s: str) -> str:
     """문장 내 URL을 제거해 자연어만 남김(공백 정리)."""
     if not s:
@@ -974,6 +1160,12 @@ def strip_urls(s: str) -> str:
     s = re.sub(r"https?://\S+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+# ✅ ISO 파싱 안전 래퍼
+def _safe_iso_to_dt(s, default_dt):
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return default_dt
 
 # ==============================================================================
 # 파이프라인
@@ -1003,30 +1195,26 @@ def run_pipeline_first_turn(user_query: str,
         return "오류: YouTube API Key가 설정되지 않았습니다."
 
     rt = RotatingYouTube(YT_API_KEYS)
-    start_dt = datetime.fromisoformat(schema["start_iso"])
-    end_dt   = datetime.fromisoformat(schema["end_iso"])
-    kw_main  = schema.get("keywords", [])
-    kw_ent   = schema.get("entities", [])
 
-    # --- 영상 ID 구성 ---
+    # ✅ ISO 실패 시 최근 7일로 폴백
+    start_dt = _safe_iso_to_dt(schema["start_iso"], now_kst() - timedelta(days=7))
+    end_dt   = _safe_iso_to_dt(schema["end_iso"],   now_kst())
+
+    kw_main  = schema.get("keywords", [])
+
+    # --- 영상 ID 구성 (메인키워드 1개만) ---
     if only_these_videos and extra_video_ids:
         # 3) URL만 전달 → 해당 URL들의 댓글만 수집
         all_ids = extra_video_ids
     else:
-        # 1) 자연어만 → 기존 검색
-        # 2) 자연어 + URL → 기존 검색 + URL 합산
+        # 1) 자연어만 → 메인키워드 1개 검색
+        # 2) 자연어 + URL → 메인키워드 검색 + URL 합산
         all_ids = []
-        for base_kw in (kw_main or ["유튜브"]):
-            # 관련성 기준 검색
-            all_ids.extend(yt_search_videos(
-                rt, base_kw, 60, "relevance",
-                kst_to_rfc3339_utc(start_dt), kst_to_rfc3339_utc(end_dt)
-            ))
-            for e in kw_ent:
-                all_ids.extend(yt_search_videos(
-                    rt, f"{base_kw} {e}", 30, "relevance",
-                    kst_to_rfc3339_utc(start_dt), kst_to_rfc3339_utc(end_dt)
-                ))
+        main_kw = (kw_main or ["유튜브"])[0]
+        all_ids.extend(yt_search_videos(
+            rt, main_kw, 60, "relevance",
+            kst_to_rfc3339_utc(start_dt), kst_to_rfc3339_utc(end_dt)
+        ))
         if extra_video_ids:
             all_ids.extend(extra_video_ids)
 
@@ -1065,7 +1253,6 @@ def run_pipeline_first_turn(user_query: str,
     payload = (
         f"[사용자 원본 질문]: {user_query}\n\n"
         f"[키워드]: {', '.join(kw_main)}\n"
-        f"[엔티티]: {', '.join(kw_ent)}\n"
         f"[기간(KST)]: {schema['start_iso']} ~ {schema['end_iso']}\n\n"
         f"[댓글 샘플]:\n{sample_text}\n"
     )
@@ -1077,7 +1264,6 @@ def run_pipeline_first_turn(user_query: str,
     gc.collect()
 
     return tidy_answer(answer_md_raw)
-
 
 def run_followup_turn(user_query: str):
     if not (schema := st.session_state.get("last_schema")):
@@ -1116,7 +1302,6 @@ def run_followup_turn(user_query: str):
 
     return response
 
-
 # ==============================================================================
 # 메인 화면 및 실행 로직
 # ==============================================================================
@@ -1149,12 +1334,10 @@ else:
     render_chat()
     scroll_to_bottom()
 
-
 # 입력창
 if prompt := st.chat_input("예) 최근 24시간 태풍상사 반응 요약해줘 / 또는 영상 URL 붙여도 OK"):
     st.session_state.chat.append({"role": "user", "content": prompt})
     st.rerun()
-
 
 # 입력 처리
 if st.session_state.chat and st.session_state.chat[-1]["role"] == "user":
@@ -1173,10 +1356,10 @@ if st.session_state.chat and st.session_state.chat[-1]["role"] == "user":
             # (3) URL만 전달 → 해당 URL들의 댓글만 수집
             response = run_pipeline_first_turn(user_query, extra_video_ids=url_ids, only_these_videos=True)
         elif has_urls and has_natural:
-            # (2) 자연어 + URL → 기존 + URL 추가 수집
+            # (2) 자연어 + URL → 메인키워드 검색 + URL 추가 수집
             response = run_pipeline_first_turn(user_query, extra_video_ids=url_ids, only_these_videos=False)
         else:
-            # (1) 자연어만 → 기존대로
+            # (1) 자연어만 → 메인키워드 1개 검색
             response = run_pipeline_first_turn(user_query)
     else:
         # 후속 턴: 기존 규칙 유지 (추가 수집 없이 대화 문맥 기반 답변)
