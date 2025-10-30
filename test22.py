@@ -54,6 +54,40 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# === [GLOBAL TWEAKS] 작은 폰트 & 카드 라인클램프 / 공통 차트 레이아웃 ===
+st.markdown("""
+<style>
+/* 전체 본문 폰트 살짝 축소 */
+html, body, [data-testid="stAppViewContainer"] { font-size: 14px; }
+[data-testid="stSidebar"] { font-size: 13px; }
+
+/* Plotly 차트 주변 여백 줄이기 */
+.stPlotlyChart { padding: 0.25rem 0 0 0; }
+
+/* 좋아요 Top10 카드: 본문 2줄로 줄임 (말줄임 처리) */
+.cc-card { margin-bottom: 12px; }
+.cc-title { font-size: 13px; margin: 2px 0 4px; }
+.cc-meta  { font-size: 12px; color:#6b7280; }
+.cc-text  {
+  font-size: 13px; line-height: 1.35; color:#111827;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+</style>
+""", unsafe_allow_html=True)
+
+def _small_fig(fig, *, height=260, title_size=14, font_size=12, legend_size=11, margin=(10,10,28,10)):
+    """Plotly 공통 축소 레이아웃 적용"""
+    l, r, t, b = margin
+    fig.update_layout(
+        height=height,
+        margin=dict(l=l, r=r, t=t, b=b),
+        font=dict(size=font_size),
+        title_font=dict(size=title_size),
+        legend=dict(font=dict(size=legend_size))
+    )
+    return fig
+
+
 # ======================================================================
 # 경로/시크릿/상수
 # ======================================================================
@@ -803,7 +837,7 @@ def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, 
 
     st.markdown("### 📊 정량 요약")
 
-    # ── 1열: ① 버블 / ② 타임라인 / ③ Top10 영상댓글 ─────────────────────────
+    # ── 1열: ① 버블 / ② 타임라인 / ③ Top10 영상댓글  →  1 2 3 ───────────────
     c1, c2, c3 = st.columns([1, 1, 1])
 
     # ① 키워드 버블
@@ -824,12 +858,13 @@ def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, 
                     query_words = [t.form for t in tokens_q if t.tag in ("NNG","NNP") and len(t.form) > 1]
                     stopset.update(query_words)
                 with st.spinner("키워드 계산 중…"):
-                    items = compute_keyword_counter_from_file(comments_csv_path, list(stopset), per_comment_cap=200)
+                    items = compute_keyword_counter_from_file(comments_csv_path, list(stopset), per_comment_cap=180)
                 fig = keyword_bubble_figure_from_counter(items)
                 if fig is None:
                     st.info("표시할 키워드가 없습니다(불용어 제거 후 남은 단어 없음).")
                 else:
-                    st.plotly_chart(fig, use_container_width=True)
+                    _small_fig(fig, height=250, title_size=13, font_size=11, legend_size=10, margin=(6,6,24,6))
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             except Exception as e:
                 st.info(f"키워드 분석 불가: {e}")
 
@@ -840,7 +875,8 @@ def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, 
             ts, label = timeseries_from_file(comments_csv_path)
             if ts is not None:
                 fig_ts = px.line(ts, x="bucket", y="count", markers=True, title=f"{label} 댓글량 추이 {scope_label}")
-                st.plotly_chart(fig_ts, use_container_width=True)
+                _small_fig(fig_ts, height=250, title_size=13, font_size=11, legend_size=10, margin=(8,8,28,8))
+                st.plotly_chart(fig_ts, use_container_width=True, config={"displayModeBar": False})
             else:
                 st.info("댓글 타임스탬프가 비어 있습니다.")
 
@@ -850,14 +886,17 @@ def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, 
             st.subheader("③ Top10 영상 댓글수")
             if df_stats is not None and not df_stats.empty:
                 top_vids = df_stats.sort_values(by="commentCount", ascending=False).head(10).copy()
-                top_vids["title_short"] = top_vids["title"].apply(lambda t: t[:20] + "…" if isinstance(t, str) and len(t) > 20 else t)
-                fig_vids = px.bar(top_vids, x="commentCount", y="title_short",
-                                  orientation="h", text="commentCount", title="Top10 영상 댓글수")
-                st.plotly_chart(fig_vids, use_container_width=True)
+                top_vids["title_short"] = top_vids["title"].apply(lambda t: t[:18] + "…" if isinstance(t, str) and len(t) > 18 else t)
+                fig_vids = px.bar(
+                    top_vids, x="commentCount", y="title_short",
+                    orientation="h", text="commentCount", title="Top10 영상 댓글수"
+                )
+                _small_fig(fig_vids, height=250, title_size=13, font_size=11, legend_size=10, margin=(8,8,30,8))
+                st.plotly_chart(fig_vids, use_container_width=True, config={"displayModeBar": False})
             else:
                 st.info("영상 메타 데이터가 없습니다.")
 
-    # ── 2열: ④ Top 작성자 / ⑤ 좋아요 Top10(2열 폭) ───────────────────────────
+    # ── 2열: ④ Top 작성자 / ⑤ 좋아요 Top10(넓은 2칸)  →  4 | 5 ───────────────
     c4, c5 = st.columns([1, 2])
 
     # ④ 댓글 작성자 활동량 Top10
@@ -867,32 +906,63 @@ def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, 
             ta = top_authors_from_file(comments_csv_path, topn=10)
             if ta is not None and not ta.empty:
                 fig_auth = px.bar(ta, x="count", y="author", orientation="h", text="count", title="Top10 댓글 작성자 활동량")
-                st.plotly_chart(fig_auth, use_container_width=True)
+                _small_fig(fig_auth, height=260, title_size=13, font_size=11, legend_size=10, margin=(8,8,30,8))
+                st.plotly_chart(fig_auth, use_container_width=True, config={"displayModeBar": False})
             else:
                 st.info("작성자 데이터 없음")
 
-    # ⑤ 댓글 좋아요 Top10 (넓게)
+    # ⑤ 댓글 좋아요 Top10 (넓게) — 카드 2열(각 5개) + 표(전체보기)
     with c5:
         with st.container(border=True):
             st.subheader("⑤ 댓글 좋아요 Top10")
-            best = []
-            for chunk in pd.read_csv(comments_csv_path, usecols=["video_id","video_title","author","text","likeCount"], chunksize=200_000):
+            best_chunks = []
+            usecols = ["video_id","video_title","author","text","likeCount"]
+            for chunk in pd.read_csv(comments_csv_path, usecols=usecols, chunksize=150_000):
                 chunk["likeCount"] = pd.to_numeric(chunk["likeCount"], errors="coerce").fillna(0).astype(int)
-                best.append(chunk.sort_values("likeCount", ascending=False).head(10))
-            if best:
-                df_top = pd.concat(best).sort_values("likeCount", ascending=False).head(10)
-                for _, row in df_top.iterrows():
-                    url = f"https://www.youtube.com/watch?v={row['video_id']}"
-                    st.markdown(
-                        f"<div style='margin-bottom:15px;'>"
-                        f"<b>{int(row['likeCount'])} 👍</b> — {row.get('author','')}<br>"
-                        f"<span style='font-size:14px;'>▶️ <a href='{url}' target='_blank' style='color:black; text-decoration:none;'>"
-                        f"{str(row.get('video_title','(제목없음)'))[:60]}</a></span><br>"
-                        f"> {str(row.get('text',''))[:150]}{'…' if len(str(row.get('text','')))>150 else ''}"
-                        f"</div>", unsafe_allow_html=True
-                    )
+                best_chunks.append(chunk.sort_values("likeCount", ascending=False).head(12))
+            if best_chunks:
+                df_top = (
+                    pd.concat(best_chunks)
+                    .sort_values("likeCount", ascending=False)
+                    .head(10)
+                    .reset_index(drop=True)
+                )
+
+                # 상단: 카드 2열(각 5개) — 텍스트 2줄 클램프, 전역 CSS 적용
+                col_left, col_right = st.columns(2)
+                for i, (_, row) in enumerate(df_top.iterrows()):
+                    target_col = col_left if i < 5 else col_right
+                    with target_col:
+                        url = f"https://www.youtube.com/watch?v={row['video_id']}"
+                        author = str(row.get('author',''))
+                        title  = str(row.get('video_title','(제목없음)'))[:60]
+                        text   = str(row.get('text','')).replace("\n", " ").strip()
+                        # 너무 길면 자르되, CSS로 2줄 클램프도 함께 적용
+                        text = text[:180]
+                        like  = int(row.get('likeCount', 0))
+                        html = f"""
+                        <div class="cc-card">
+                          <div class="cc-meta"><b>{like:,} 👍</b> — {author}</div>
+                          <div class="cc-title">▶️ <a href="{url}" target="_blank" style="color:#111827; text-decoration:none;">{title}</a></div>
+                          <div class="cc-text">{text}</div>
+                        </div>
+                        """
+                        st.markdown(html, unsafe_allow_html=True)
+
+                # 하단: 전체보기(표) — 스크롤 테이블로 컴팩트하게
+                with st.expander("전체 보기 (표)"):
+                    df_show = df_top.copy()
+                    df_show = df_show.rename(columns={
+                        "video_title":"영상제목",
+                        "author":"작성자",
+                        "text":"댓글",
+                        "likeCount":"좋아요"
+                    })[["영상제목","작성자","좋아요","댓글"]]
+                    # 표 높이를 낮춰서 과도한 길이 방지
+                    st.dataframe(df_show, use_container_width=True, height=300)
             else:
                 st.info("좋아요 상위 댓글 정보가 없습니다.")
+
 
 def render_metadata_and_downloads():
     schema = st.session_state.get("last_schema")
