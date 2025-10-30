@@ -798,10 +798,16 @@ def top_authors_from_file(csv_path: str, topn=10):
     return s.reset_index().rename(columns={"index": "author", 0: "count"}).rename(columns={"count": "count"})
 
 def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, scope_label="(KST 기준)"):
-    if not comments_csv_path or not os.path.exists(comments_csv_path): return
+    if not comments_csv_path or not os.path.exists(comments_csv_path):
+        return
+
     st.markdown("### 📊 정량 요약")
-    col1, col2 = st.columns(2)
-    with col1:
+
+    # ── 1열: ① 버블 / ② 타임라인 / ③ Top10 영상댓글 ─────────────────────────
+    c1, c2, c3 = st.columns([1, 1, 1])
+
+    # ① 키워드 버블
+    with c1:
         with st.container(border=True):
             st.subheader("① 키워드 버블")
             try:
@@ -827,7 +833,8 @@ def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, 
             except Exception as e:
                 st.info(f"키워드 분석 불가: {e}")
 
-    with col2:
+    # ② 시점별 댓글량 추이
+    with c2:
         with st.container(border=True):
             st.subheader("② 시점별 댓글량 추이")
             ts, label = timeseries_from_file(comments_csv_path)
@@ -837,44 +844,55 @@ def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, 
             else:
                 st.info("댓글 타임스탬프가 비어 있습니다.")
 
-    if df_stats is not None and not df_stats.empty:
-        col3, col4 = st.columns(2)
-        with col3:
-            with st.container(border=True):
-                st.subheader("③ Top10 영상 댓글수")
+    # ③ Top10 영상 댓글수
+    with c3:
+        with st.container(border=True):
+            st.subheader("③ Top10 영상 댓글수")
+            if df_stats is not None and not df_stats.empty:
                 top_vids = df_stats.sort_values(by="commentCount", ascending=False).head(10).copy()
                 top_vids["title_short"] = top_vids["title"].apply(lambda t: t[:20] + "…" if isinstance(t, str) and len(t) > 20 else t)
                 fig_vids = px.bar(top_vids, x="commentCount", y="title_short",
                                   orientation="h", text="commentCount", title="Top10 영상 댓글수")
                 st.plotly_chart(fig_vids, use_container_width=True)
-        with col4:
-            with st.container(border=True):
-                st.subheader("④ 댓글 작성자 활동량 Top10")
-                ta = top_authors_from_file(comments_csv_path, topn=10)
-                if ta is not None and not ta.empty:
-                    fig_auth = px.bar(ta, x="count", y="author", orientation="h", text="count", title="Top10 댓글 작성자 활동량")
-                    st.plotly_chart(fig_auth, use_container_width=True)
-                else:
-                    st.info("작성자 데이터 없음")
+            else:
+                st.info("영상 메타 데이터가 없습니다.")
 
-    with st.container(border=True):
-        st.subheader("⑤ 댓글 좋아요 Top10")
-        best = []
-        for chunk in pd.read_csv(comments_csv_path, usecols=["video_id","video_title","author","text","likeCount"], chunksize=200_000):
-            chunk["likeCount"] = pd.to_numeric(chunk["likeCount"], errors="coerce").fillna(0).astype(int)
-            best.append(chunk.sort_values("likeCount", ascending=False).head(10))
-        if best:
-            df_top = pd.concat(best).sort_values("likeCount", ascending=False).head(10)
-            for _, row in df_top.iterrows():
-                url = f"https://www.youtube.com/watch?v={row['video_id']}"
-                st.markdown(
-                    f"<div style='margin-bottom:15px;'>"
-                    f"<b>{int(row['likeCount'])} 👍</b> — {row.get('author','')}<br>"
-                    f"<span style='font-size:14px;'>▶️ <a href='{url}' target='_blank' style='color:black; text-decoration:none;'>"
-                    f"{str(row.get('video_title','(제목없음)'))[:60]}</a></span><br>"
-                    f"> {str(row.get('text',''))[:150]}{'…' if len(str(row.get('text','')))>150 else ''}"
-                    f"</div>", unsafe_allow_html=True
-                )
+    # ── 2열: ④ Top 작성자 / ⑤ 좋아요 Top10(2열 폭) ───────────────────────────
+    c4, c5 = st.columns([1, 2])
+
+    # ④ 댓글 작성자 활동량 Top10
+    with c4:
+        with st.container(border=True):
+            st.subheader("④ 댓글 작성자 활동량 Top10")
+            ta = top_authors_from_file(comments_csv_path, topn=10)
+            if ta is not None and not ta.empty:
+                fig_auth = px.bar(ta, x="count", y="author", orientation="h", text="count", title="Top10 댓글 작성자 활동량")
+                st.plotly_chart(fig_auth, use_container_width=True)
+            else:
+                st.info("작성자 데이터 없음")
+
+    # ⑤ 댓글 좋아요 Top10 (넓게)
+    with c5:
+        with st.container(border=True):
+            st.subheader("⑤ 댓글 좋아요 Top10")
+            best = []
+            for chunk in pd.read_csv(comments_csv_path, usecols=["video_id","video_title","author","text","likeCount"], chunksize=200_000):
+                chunk["likeCount"] = pd.to_numeric(chunk["likeCount"], errors="coerce").fillna(0).astype(int)
+                best.append(chunk.sort_values("likeCount", ascending=False).head(10))
+            if best:
+                df_top = pd.concat(best).sort_values("likeCount", ascending=False).head(10)
+                for _, row in df_top.iterrows():
+                    url = f"https://www.youtube.com/watch?v={row['video_id']}"
+                    st.markdown(
+                        f"<div style='margin-bottom:15px;'>"
+                        f"<b>{int(row['likeCount'])} 👍</b> — {row.get('author','')}<br>"
+                        f"<span style='font-size:14px;'>▶️ <a href='{url}' target='_blank' style='color:black; text-decoration:none;'>"
+                        f"{str(row.get('video_title','(제목없음)'))[:60]}</a></span><br>"
+                        f"> {str(row.get('text',''))[:150]}{'…' if len(str(row.get('text','')))>150 else ''}"
+                        f"</div>", unsafe_allow_html=True
+                    )
+            else:
+                st.info("좋아요 상위 댓글 정보가 없습니다.")
 
 def render_metadata_and_downloads():
     schema = st.session_state.get("last_schema")
