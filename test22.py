@@ -120,8 +120,6 @@ def ensure_state():
         "last_df": None,
         "sample_text": "",
         "loaded_session_name": None,
-        # rerun 후 차트를 그릴지 여부
-        "render_viz_after_response": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -862,20 +860,22 @@ if not st.session_state.chat:
         unsafe_allow_html=True
     )
 else:
+    # ① 메타/다운로드
     render_metadata_and_downloads()
+
+    # ② 시각화(항상 메타/다운로드 바로 아래, 채팅 위에 고정)
+    if st.session_state.get("last_csv"):
+        with st.container(border=True):
+            render_quant_viz_from_paths(
+                st.session_state["last_csv"],
+                st.session_state.get("last_df"),
+                scope_label="(KST)"
+            )
+
+    # ③ 채팅
     render_chat()
     scroll_to_bottom()
 
-# --- (ADD) 응답 직후 차트를 안정적으로 렌더링하는 슬롯 ---
-if st.session_state.get("render_viz_after_response") and st.session_state.get("last_csv"):
-    with st.container(border=True):
-        render_quant_viz_from_paths(
-            st.session_state["last_csv"],
-            st.session_state.get("last_df"),
-            scope_label="(KST)"
-        )
-    # 한 번 그리고 플래그 끄기
-    st.session_state["render_viz_after_response"] = False
 
 # ======================================================================
 # 입력창 + 처리
@@ -904,8 +904,5 @@ if st.session_state.chat and st.session_state.chat[-1]["role"] == "user":
 
     st.session_state.chat.append({"role":"assistant","content":response})
 
-    # 분석 결과 생성 이후: 차트는 rerun 뒤에 안정적으로 그리기
-    if st.session_state.get("last_csv"):
-        st.session_state["render_viz_after_response"] = True
 
     st.rerun()
